@@ -1,0 +1,16 @@
+{
+  "mode": "server",
+  "listen": ":8443",
+  "uuid": "550e8400-e29b-41d4-a716-446655440000",
+  "protocol": "tcp",
+  "transport": "h2",
+  "tls": {
+    "auto_cert": true
+  },
+  "forward": "127.0.0.1:10808",
+  "ip_passthrough": true,
+  "log": {
+    "enabled": true,
+    "level": "debug"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "mode": "server",
+  "listen": ":19443",
+  "uuid": "your-uuid-here",
+  "protocol": "tcp",
+  "tls": {
+    "auto_cert": true
+  },
+  "forward": "127.0.0.1:10808",
+  "ip_passthrough": false,
+  "mptcp": false,
+  "log": {
+    "enabled": true,
+    "level": "info"
+  }
+}

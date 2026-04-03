@@ -1,0 +1,16 @@
+{
+  "mode": "client",
+  "listen": "127.0.0.1:30301",
+  "uuid": "your-uuid-here",
+  "protocol": "tcp",
+  "servers": [
+    {"address": "decrypt-server-a.com:19443", "enabled": true},
+    {"address": "decrypt-server-b.com:19443", "enabled": true}
+  ],
+  "ip_passthrough": false,
+  "mptcp": false,
+  "log": {
+    "enabled": true,
+    "level": "info"
+  }
+}

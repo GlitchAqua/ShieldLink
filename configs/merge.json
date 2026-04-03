@@ -1,0 +1,15 @@
+{
+  "mode": "merge",
+  "listen": ":19000",
+  "uuid": "your-uuid-here",
+  "forward": "127.0.0.1:10808",
+  "ip_passthrough": false,
+  "log": {
+    "enabled": true,
+    "level": "info"
+  },
+  "reassembly": {
+    "buffer_size": 4194304,
+    "timeout": 5
+  }
+}
