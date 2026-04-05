@@ -58,7 +58,14 @@ type Header struct {
 	InitialData []byte
 }
 
-// Authenticator handles HMAC verification and replay prevention.
+// Route represents a UUID→forward mapping for multi-tenant routing.
+type Route struct {
+	UUID    string `json:"uuid"`
+	Forward string `json:"forward"`
+	key     DerivedKey
+}
+
+// Authenticator handles HMAC verification and replay prevention (single UUID, legacy).
 type Authenticator struct {
 	key         DerivedKey
 	mu          sync.Mutex
@@ -176,6 +183,166 @@ func (a *Authenticator) Verify(data []byte) (*Header, error) {
 		SessionID:   sessionID,
 		InitialData: initialData,
 	}, nil
+}
+
+// MultiAuthenticator handles multiple UUID routes on a single port.
+type MultiAuthenticator struct {
+	mu          sync.RWMutex
+	routes      map[[KeyHintSize]byte]*Route
+	replayCache map[[HMACSize]byte]time.Time
+}
+
+// NewMultiAuthenticator creates an authenticator supporting multiple UUID→forward routes.
+func NewMultiAuthenticator(routes []Route) *MultiAuthenticator {
+	ma := &MultiAuthenticator{
+		routes:      make(map[[KeyHintSize]byte]*Route),
+		replayCache: make(map[[HMACSize]byte]time.Time),
+	}
+	for i := range routes {
+		r := &routes[i]
+		r.key = DeriveKey(r.UUID)
+		ma.routes[r.key.KeyHint] = r
+	}
+	go ma.cleanupLoop()
+	return ma
+}
+
+// UpdateRoutes hot-reloads the route table without restarting.
+func (ma *MultiAuthenticator) UpdateRoutes(routes []Route) {
+	newMap := make(map[[KeyHintSize]byte]*Route, len(routes))
+	for i := range routes {
+		r := &routes[i]
+		r.key = DeriveKey(r.UUID)
+		newMap[r.key.KeyHint] = r
+	}
+	ma.mu.Lock()
+	ma.routes = newMap
+	ma.mu.Unlock()
+}
+
+// Routes returns a copy of the current route list.
+func (ma *MultiAuthenticator) Routes() []Route {
+	ma.mu.RLock()
+	defer ma.mu.RUnlock()
+	out := make([]Route, 0, len(ma.routes))
+	for _, r := range ma.routes {
+		out = append(out, Route{UUID: r.UUID, Forward: r.Forward})
+	}
+	return out
+}
+
+// Verify parses and verifies an incoming header, returning the matched route.
+func (ma *MultiAuthenticator) Verify(data []byte) (*Header, *Route, error) {
+	if len(data) < MinHeaderSize {
+		return nil, nil, errors.New("data too short")
+	}
+	pos := 0
+
+	// KEY_HINT
+	var hint [KeyHintSize]byte
+	copy(hint[:], data[pos:pos+KeyHintSize])
+	pos += KeyHintSize
+
+	ma.mu.RLock()
+	route, ok := ma.routes[hint]
+	ma.mu.RUnlock()
+	if !ok {
+		return nil, nil, errors.New("key hint mismatch")
+	}
+
+	// HMAC
+	var receivedHMAC [HMACSize]byte
+	copy(receivedHMAC[:], data[pos:pos+HMACSize])
+	pos += HMACSize
+
+	// NONCE
+	var nonce [NonceSize]byte
+	copy(nonce[:], data[pos:pos+NonceSize])
+	pos += NonceSize
+
+	// Verify timestamp
+	ts := int64(binary.BigEndian.Uint32(nonce[:4]))
+	now := time.Now().Unix()
+	diff := now - ts
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > int64(NonceWindow.Seconds()) {
+		return nil, nil, errors.New("nonce expired")
+	}
+
+	// Verify HMAC
+	mac := hmac.New(sha256.New, route.key.MasterKey[:])
+	mac.Write(nonce[:])
+	expected := mac.Sum(nil)
+	if !hmac.Equal(expected, receivedHMAC[:]) {
+		return nil, nil, errors.New("hmac mismatch")
+	}
+
+	// Replay check
+	ma.mu.Lock()
+	if _, exists := ma.replayCache[receivedHMAC]; exists {
+		ma.mu.Unlock()
+		return nil, nil, errors.New("replay detected")
+	}
+	ma.replayCache[receivedHMAC] = time.Now().Add(ReplayCacheTTL)
+	ma.mu.Unlock()
+
+	// PAD_LEN
+	if pos+PadLenSize > len(data) {
+		return nil, nil, errors.New("data too short for pad_len")
+	}
+	padLen := int(binary.BigEndian.Uint16(data[pos : pos+PadLenSize]))
+	pos += PadLenSize
+	if padLen > 900 {
+		return nil, nil, errors.New("padding too large")
+	}
+	if pos+padLen > len(data) {
+		return nil, nil, errors.New("data too short for padding")
+	}
+	pos += padLen
+
+	// FLAGS
+	if pos+FlagsSize > len(data) {
+		return nil, nil, errors.New("data too short for flags")
+	}
+	flags := data[pos]
+	pos += FlagsSize
+
+	// SESSION_ID
+	if pos+SessionSize > len(data) {
+		return nil, nil, errors.New("data too short for session_id")
+	}
+	var sessionID [SessionSize]byte
+	copy(sessionID[:], data[pos:pos+SessionSize])
+	pos += SessionSize
+
+	// INITIAL_DATA
+	var initialData []byte
+	if pos < len(data) {
+		initialData = make([]byte, len(data)-pos)
+		copy(initialData, data[pos:])
+	}
+
+	return &Header{
+		Flags:       flags,
+		SessionID:   sessionID,
+		InitialData: initialData,
+	}, route, nil
+}
+
+func (ma *MultiAuthenticator) cleanupLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	for range ticker.C {
+		ma.mu.Lock()
+		now := time.Now()
+		for k, expiry := range ma.replayCache {
+			if now.After(expiry) {
+				delete(ma.replayCache, k)
+			}
+		}
+		ma.mu.Unlock()
+	}
 }
 
 // BuildHeader constructs an authentication header for the client side.

@@ -40,7 +40,7 @@ func StartEmbeddedListener(cfg *ClientConfig) (host string, port int, err error)
 func handleLocalConn(local net.Conn, pool *Pool, cfg *ClientConfig) {
 	defer local.Close()
 
-	if cfg.Aggregate && cfg.MergeAddress != "" {
+	if cfg.Aggregate {
 		handleAggregateConn(local, pool, cfg)
 		return
 	}
@@ -75,34 +75,57 @@ func handleAggregateConn(local net.Conn, pool *Pool, cfg *ClientConfig) {
 		return
 	}
 
-	// Connect to merge server for download (reassembled response path)
-	mergeConn, err := net.DialTimeout("tcp", cfg.MergeAddress, 10*time.Second)
-	if err != nil {
-		log.Warnln("[ShieldLink] aggregate: merge %s failed: %v", cfg.MergeAddress, err)
-		for _, c := range serverConns {
-			c.Close()
-		}
-		return
-	}
-
 	sessionID := NewSessionID()
 	var aggSession [8]byte
 	copy(aggSession[:], sessionID[:])
 
-	// Send download channel header: "DLCH" + SESSION_ID
-	dlHeader := make([]byte, 12)
-	copy(dlHeader[0:4], []byte("DLCH"))
-	copy(dlHeader[4:12], aggSession[:])
-	if _, err := mergeConn.Write(dlHeader); err != nil {
-		log.Warnln("[ShieldLink] aggregate: send download header failed: %v", err)
-		mergeConn.Close()
-		for _, c := range serverConns {
-			c.Close()
+	// Connect download channel
+	var mergeConn net.Conn
+	if cfg.MergeAddress != "" {
+		// Legacy: connect to merge server directly
+		var err error
+		mergeConn, err = net.DialTimeout("tcp", cfg.MergeAddress, 10*time.Second)
+		if err != nil {
+			log.Warnln("[ShieldLink] aggregate: merge %s failed: %v", cfg.MergeAddress, err)
+			for _, c := range serverConns {
+				c.Close()
+			}
+			return
 		}
-		return
+		dlHeader := make([]byte, 12)
+		copy(dlHeader[0:4], []byte("DLCH"))
+		copy(dlHeader[4:12], aggSession[:])
+		if _, err := mergeConn.Write(dlHeader); err != nil {
+			log.Warnln("[ShieldLink] aggregate: send download header failed: %v", err)
+			mergeConn.Close()
+			for _, c := range serverConns {
+				c.Close()
+			}
+			return
+		}
+		log.Infoln("[ShieldLink] aggregate: %d paths -> merge %s, session=%x", len(serverConns), cfg.MergeAddress, aggSession)
+	} else {
+		// Server-side merge: download channel goes through a decrypt server
+		// The DLCH header is sent as initialData in the auth, relayed to merge by the server
+		ep := pool.Pick()
+		if ep == nil {
+			log.Warnln("[ShieldLink] aggregate: no server for download channel")
+			for _, c := range serverConns {
+				c.Close()
+			}
+			return
+		}
+		var err error
+		mergeConn, err = pool.DialDownloadChannel(ep, aggSession)
+		if err != nil {
+			log.Warnln("[ShieldLink] aggregate: download channel via %s failed: %v", ep.Address, err)
+			for _, c := range serverConns {
+				c.Close()
+			}
+			return
+		}
+		log.Infoln("[ShieldLink] aggregate: %d paths -> server-side merge, session=%x", len(serverConns), aggSession)
 	}
-
-	log.Infoln("[ShieldLink] aggregate: %d paths -> merge %s, session=%x", len(serverConns), cfg.MergeAddress, aggSession)
 
 	writer := NewAggregateWriter(aggSession, serverConns, 0)
 	defer writer.Close()

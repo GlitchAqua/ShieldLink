@@ -18,11 +18,19 @@ type Config struct {
 	TLS           TLSConfig     `json:"tls"`
 	Forward       string        `json:"forward"`
 	Servers       []ServerEntry `json:"servers"`      // client mode: list of decrypt servers
+	Routes        []RouteEntry  `json:"routes"`       // server/merge mode: multi-UUID routes
+	AdminAddr     string        `json:"admin_addr"`   // admin API listen address, e.g. ":19480"
+	AdminToken    string        `json:"admin_token"`  // admin API auth token
 	IPPassthrough bool          `json:"ip_passthrough"`
 	MPTCP         bool          `json:"mptcp"`
 	Log           LogConfig     `json:"log"`
 	API           APIConfig     `json:"api"`
 	Reassembly    MergeConfig   `json:"reassembly"`
+}
+
+type RouteEntry struct {
+	UUID    string `json:"uuid"`
+	Forward string `json:"forward"`
 }
 
 type TLSConfig struct {
@@ -170,17 +178,35 @@ func parse(data []byte) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
-	if cfg.UUID == "" {
-		return nil, fmt.Errorf("uuid is required")
-	}
 	if cfg.Mode != "server" && cfg.Mode != "merge" && cfg.Mode != "client" {
 		return nil, fmt.Errorf("mode must be 'server', 'merge', or 'client'")
 	}
 	if cfg.Listen == "" {
 		return nil, fmt.Errorf("listen is required")
 	}
-	if cfg.Forward == "" && cfg.Mode != "client" {
-		return nil, fmt.Errorf("forward is required")
+
+	// Compatibility: if routes is empty but uuid+forward are set, convert to single route
+	if len(cfg.Routes) == 0 && cfg.UUID != "" && cfg.Forward != "" {
+		cfg.Routes = []RouteEntry{{UUID: cfg.UUID, Forward: cfg.Forward}}
+	}
+
+	// Validate per mode
+	switch cfg.Mode {
+	case "server":
+		if len(cfg.Routes) == 0 {
+			return nil, fmt.Errorf("at least one route (uuid+forward) is required for server mode")
+		}
+	case "merge":
+		if cfg.Forward == "" {
+			return nil, fmt.Errorf("forward is required for merge mode")
+		}
+		if cfg.UUID == "" && len(cfg.Routes) == 0 {
+			return nil, fmt.Errorf("uuid is required for merge mode")
+		}
+	case "client":
+		if cfg.UUID == "" {
+			return nil, fmt.Errorf("uuid is required for client mode")
+		}
 	}
 
 	return cfg, nil

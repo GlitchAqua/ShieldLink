@@ -23,6 +23,19 @@ type Merge struct {
 	sessions         sync.Map // map[[AggSessionSize]byte]*Session
 	pendingDownloads sync.Map // map[[AggSessionSize]byte]net.Conn
 	timeout          time.Duration
+	forwardMu        sync.RWMutex
+}
+
+func (m *Merge) GetForward() string {
+	m.forwardMu.RLock()
+	defer m.forwardMu.RUnlock()
+	return m.cfg.Forward
+}
+
+func (m *Merge) SetForward(forward string) {
+	m.forwardMu.Lock()
+	defer m.forwardMu.Unlock()
+	m.cfg.Forward = forward
 }
 
 func New(cfg *config.Config) *Merge {
@@ -167,7 +180,7 @@ func (m *Merge) getOrCreateSession(id [protocol.AggSessionSize]byte) *Session {
 	}
 
 	// New session: connect to proxy server
-	target, err := net.DialTimeout("tcp", m.cfg.Forward, 10*time.Second)
+	target, err := net.DialTimeout("tcp", m.GetForward(), 10*time.Second)
 	if err != nil {
 		log.L.Error("merge: dial forward failed", "forward", m.cfg.Forward, "err", err)
 		s := newSession(id, &discardConn{})
@@ -175,7 +188,7 @@ func (m *Merge) getOrCreateSession(id [protocol.AggSessionSize]byte) *Session {
 		return s
 	}
 
-	log.L.Info("merge: new session", "session", fmt.Sprintf("%x", id), "forward", m.cfg.Forward)
+	log.L.Info("merge: new session", "session", fmt.Sprintf("%x", id), "forward", m.GetForward())
 	s := newSession(id, target)
 	m.sessions.Store(id, s)
 

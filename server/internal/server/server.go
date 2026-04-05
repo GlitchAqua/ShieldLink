@@ -18,20 +18,37 @@ import (
 
 type Server struct {
 	cfg  *config.Config
-	auth *auth.Authenticator
+	auth *auth.MultiAuthenticator
 }
 
 func New(cfg *config.Config) *Server {
+	routes := make([]auth.Route, len(cfg.Routes))
+	for i, r := range cfg.Routes {
+		routes[i] = auth.Route{UUID: r.UUID, Forward: r.Forward}
+	}
 	return &Server{
 		cfg:  cfg,
-		auth: auth.NewAuthenticator(cfg.UUID),
+		auth: auth.NewMultiAuthenticator(routes),
 	}
+}
+
+// Auth returns the multi-authenticator for admin API access.
+func (s *Server) Auth() *auth.MultiAuthenticator {
+	return s.auth
 }
 
 func (s *Server) Run() error {
 	switch s.cfg.Protocol {
 	case "udp":
 		return s.runQUIC()
+	case "both":
+		// Start QUIC in background, TLS in foreground
+		go func() {
+			if err := s.runQUIC(); err != nil {
+				log.L.Error("QUIC listener error", "err", err)
+			}
+		}()
+		return s.runTLS()
 	default:
 		return s.runTLS()
 	}
@@ -82,7 +99,7 @@ func (s *Server) handleTCPConn(conn net.Conn) {
 	}
 	conn.SetReadDeadline(time.Time{})
 
-	header, err := s.auth.Verify(buf[:n])
+	header, route, err := s.auth.Verify(buf[:n])
 	if err != nil {
 		log.L.Warn("auth failed", "remote", remoteAddr, "err", err)
 		return
@@ -91,12 +108,13 @@ func (s *Server) handleTCPConn(conn net.Conn) {
 	log.L.Info("TCP authenticated",
 		"remote", remoteAddr,
 		"session", fmt.Sprintf("%x", header.SessionID),
+		"forward", route.Forward,
 		"initial_data_len", len(header.InitialData),
 	)
 
-	target, err := net.DialTimeout("tcp", s.cfg.Forward, 10*time.Second)
+	target, err := net.DialTimeout("tcp", route.Forward, 10*time.Second)
 	if err != nil {
-		log.L.Error("dial forward failed", "forward", s.cfg.Forward, "err", err)
+		log.L.Error("dial forward failed", "forward", route.Forward, "err", err)
 		return
 	}
 	defer target.Close()
@@ -167,7 +185,7 @@ func (s *Server) handleQUICConn(qconn *quic.Conn) {
 		return
 	}
 
-	header, err := s.auth.Verify(buf[:n])
+	header, route, err := s.auth.Verify(buf[:n])
 	if err != nil {
 		log.L.Warn("QUIC auth failed", "remote", remoteAddr, "err", err)
 		qconn.CloseWithError(3, "auth failed")
@@ -177,12 +195,13 @@ func (s *Server) handleQUICConn(qconn *quic.Conn) {
 	log.L.Info("QUIC authenticated",
 		"remote", remoteAddr,
 		"session", fmt.Sprintf("%x", header.SessionID),
+		"forward", route.Forward,
 	)
 
 	// After auth, the QUIC stream becomes a bidirectional tunnel (like TCP)
-	target, err := net.DialTimeout("tcp", s.cfg.Forward, 10*time.Second)
+	target, err := net.DialTimeout("tcp", route.Forward, 10*time.Second)
 	if err != nil {
-		log.L.Error("dial forward failed", "forward", s.cfg.Forward, "err", err)
+		log.L.Error("dial forward failed", "forward", route.Forward, "err", err)
 		qconn.CloseWithError(4, "forward error")
 		return
 	}

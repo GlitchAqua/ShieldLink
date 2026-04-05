@@ -1,11 +1,15 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"time"
 
+	"shieldlink-server/internal/auth"
 	"shieldlink-server/internal/client"
 	"shieldlink-server/internal/config"
 	"shieldlink-server/internal/log"
@@ -18,7 +22,18 @@ func main() {
 	apiURL := flag.String("api", "", "API server URL to fetch config from")
 	apiToken := flag.String("token", "", "API authentication token")
 	mode := flag.String("mode", "", "override mode (server|merge)")
+	hookMode := flag.Bool("hook", false, "hook mode: read YAML, start tunnels, write modified YAML")
 	flag.Parse()
+
+	// Hook mode: process a proxy config YAML for Android integration
+	if *hookMode {
+		if flag.NArg() < 2 {
+			fmt.Fprintf(os.Stderr, "usage: shieldlink-server --hook <input.yaml> <output.yaml>\n")
+			os.Exit(1)
+		}
+		runHook(flag.Arg(0), flag.Arg(1))
+		return
+	}
 
 	var cfg *config.Config
 	var err error
@@ -91,12 +106,18 @@ func main() {
 		}
 	case "server":
 		s := server.New(cfg)
+		if cfg.AdminAddr != "" {
+			go startAdminAPI(cfg.AdminAddr, cfg.AdminToken, s.Auth())
+		}
 		if err := s.Run(); err != nil {
 			log.L.Error("server error", "err", err)
 			os.Exit(1)
 		}
 	case "merge":
 		m := merge.New(cfg)
+		if cfg.AdminAddr != "" {
+			go startMergeAdminAPI(cfg.AdminAddr, cfg.AdminToken, m)
+		}
 		if err := m.Run(); err != nil {
 			log.L.Error("merge error", "err", err)
 			os.Exit(1)
@@ -104,5 +125,147 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode: %s\n", cfg.Mode)
 		os.Exit(1)
+	}
+}
+
+// startAdminAPI starts a lightweight HTTP API for managing routes at runtime.
+func startAdminAPI(addr, token string, ma *auth.MultiAuthenticator) {
+	mux := http.NewServeMux()
+
+	checkToken := func(w http.ResponseWriter, r *http.Request) bool {
+		if token == "" {
+			return true
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
+
+	mux.HandleFunc("/api/routes", func(w http.ResponseWriter, r *http.Request) {
+		if !checkToken(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.Method {
+		case http.MethodGet:
+			routes := ma.Routes()
+			json.NewEncoder(w).Encode(routes)
+
+		case http.MethodPut:
+			body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			if err != nil {
+				http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+				return
+			}
+			var req struct {
+				Routes []auth.Route `json:"routes"`
+			}
+			if err := json.Unmarshal(body, &req); err != nil {
+				http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+				return
+			}
+			ma.UpdateRoutes(req.Routes)
+			log.L.Info("admin: routes updated", "count", len(req.Routes))
+			json.NewEncoder(w).Encode(map[string]any{
+				"message": fmt.Sprintf("updated %d routes", len(req.Routes)),
+			})
+
+		default:
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		if !checkToken(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		routes := ma.Routes()
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":      "ok",
+			"route_count": len(routes),
+		})
+	})
+
+	log.L.Info("admin API started", "addr", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.L.Error("admin API error", "err", err)
+	}
+}
+
+// startMergeAdminAPI starts an admin API for the merge server to receive route updates.
+func startMergeAdminAPI(addr, token string, m *merge.Merge) {
+	mux := http.NewServeMux()
+
+	checkToken := func(w http.ResponseWriter, r *http.Request) bool {
+		if token == "" {
+			return true
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
+
+	mux.HandleFunc("/api/routes", func(w http.ResponseWriter, r *http.Request) {
+		if !checkToken(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.Method {
+		case http.MethodGet:
+			json.NewEncoder(w).Encode([]map[string]string{
+				{"uuid": "merge", "forward": m.GetForward()},
+			})
+
+		case http.MethodPut:
+			body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			if err != nil {
+				http.Error(w, `{"error":"read body"}`, http.StatusBadRequest)
+				return
+			}
+			var req struct {
+				Routes []struct {
+					UUID    string `json:"uuid"`
+					Forward string `json:"forward"`
+				} `json:"routes"`
+			}
+			if err := json.Unmarshal(body, &req); err != nil {
+				http.Error(w, `{"error":"invalid json"}`, http.StatusBadRequest)
+				return
+			}
+			// Use the first route's forward as the merge forward target
+			if len(req.Routes) > 0 {
+				m.SetForward(req.Routes[0].Forward)
+				log.L.Info("merge admin: forward updated", "forward", req.Routes[0].Forward)
+			}
+			json.NewEncoder(w).Encode(map[string]any{
+				"message": fmt.Sprintf("updated forward to %d routes", len(req.Routes)),
+			})
+
+		default:
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		}
+	})
+
+	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		if !checkToken(w, r) {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"forward": m.GetForward(),
+		})
+	})
+
+	log.L.Info("merge admin API started", "addr", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.L.Error("merge admin API error", "err", err)
 	}
 }

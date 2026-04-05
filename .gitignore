@@ -2,3 +2,9 @@ bin/
 *.exe
 *.gz
 *.log
+*.db
+node_modules/
+dist/
+panel/web/node_modules/
+panel/web/dist/
+panel/data/

@@ -116,6 +116,55 @@ func (p *Pool) DialTunnel(ep *Endpoint) (net.Conn, error) {
 	return conn, nil
 }
 
+// DialDownloadChannel connects to a decrypt server and includes a DLCH download
+// channel header as initialData, so the server relays it to the merge server.
+func (p *Pool) DialDownloadChannel(ep *Endpoint, aggSessionID [SessionSize]byte) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(ep.Address)
+	if err != nil {
+		return nil, err
+	}
+
+	var ip netip.Addr
+	ip, err = resolver.ResolveIPWithResolver(context.Background(), host, resolver.ProxyServerHostResolver)
+	if err != nil {
+		ip, err = netip.ParseAddr(host)
+		if err != nil {
+			return nil, fmt.Errorf("resolve %s: %w", host, err)
+		}
+	}
+
+	resolved := net.JoinHostPort(ip.String(), port)
+
+	var conn net.Conn
+	if p.cfg.Protocol == "udp" {
+		conn, err = p.dialQUIC(resolved)
+	} else {
+		conn, err = p.dialTLS(resolved)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var flags byte
+	if p.cfg.IPPassthrough {
+		flags |= FlagIPPassthrough
+	}
+
+	// Build DLCH header (4 bytes magic + 8 bytes session ID) as initialData
+	dlHeader := make([]byte, 12)
+	copy(dlHeader[0:4], []byte("DLCH"))
+	copy(dlHeader[4:12], aggSessionID[:])
+
+	connSessionID := NewSessionID()
+	header := BuildHeader(p.cfg.UUID, flags, connSessionID, dlHeader)
+	if _, err := conn.Write(header); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return conn, nil
+}
+
 func (p *Pool) dialTLS(resolved string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	if p.cfg.MPTCP {
